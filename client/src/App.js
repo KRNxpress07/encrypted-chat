@@ -162,7 +162,7 @@ function App() {
   useEffect(() => {
   if (!joinedRoom) return;
 
-  const SERVER_URL = 'http://localhost:3001';
+  const SERVER_URL = 'https://encrypted-chat-server-sayx.onrender.com';
   addDebugLog(`🌐 Connecting to server: ${SERVER_URL}`);
   
   socketRef.current = io(SERVER_URL, {
