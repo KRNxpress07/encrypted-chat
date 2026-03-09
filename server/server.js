@@ -12,7 +12,10 @@ const server = http.createServer(app);
 // Configure Socket.IO with CORS to allow frontend connections
 const io = socketIO(server, {
   cors: {
-    origin: "*", // Allow all origins (for development)
+    origin: [
+      "https://encrypted-chat-ten.vercel.app",
+      "http://localhost:3000"
+    ],
     methods: ["GET", "POST"]
   }
 });
