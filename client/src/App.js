@@ -362,36 +362,46 @@ function App() {
   };
 
   const joinRoom = async () => {
-    if (!roomId.trim() || !username.trim()) {
-      alert('⚠️ Please enter both username and room ID');
-      return;
-    }
+  if (!roomId.trim() || !username.trim()) {
+    alert('⚠️ Please enter both username and room ID');
+    return;
+  }
 
-    addDebugLog(`🚀 Joining room: ${roomId}`);
-    const keys = await initializeKeys();
+  addDebugLog(`🚀 Joining room: ${roomId}`);
+  const keys = await initializeKeys();
+  
+  if (keys) {
+    setJoinedRoom(true);
     
-    if (keys) {
-      setJoinedRoom(true);
+    // Wait for socket to connect with retry logic
+    const tryJoinRoom = async (attempts = 0) => {
+      if (attempts > 10) {
+        addDebugLog('❌ Failed to join room after 10 attempts');
+        return;
+      }
       
-      // Wait for socket to connect, then join room and share keys
-      setTimeout(async () => {
-        if (socketRef.current && socketRef.current.connected) {
-          const exportedRSA = await CryptoUtils.exportPublicKey(keys.rsa.publicKey);
-          const exportedAES = await exportAESKey(keys.aes);
-          
-          socketRef.current.emit('join-room', {
-            roomId,
-            userId,
-            username,
-            rsaPublicKey: exportedRSA,
-            aesKey: exportedAES // Share AES key with peers
-          });
-          
-          addDebugLog(`✅ Joined room successfully`);
-        }
-      }, 500);
-    }
-  };
+      if (socketRef.current && socketRef.current.connected) {
+        const exportedRSA = await CryptoUtils.exportPublicKey(keys.rsa.publicKey);
+        const exportedAES = await exportAESKey(keys.aes);
+        
+        socketRef.current.emit('join-room', {
+          roomId,
+          userId,
+          username,
+          rsaPublicKey: exportedRSA,
+          aesKey: exportedAES
+        });
+        
+        addDebugLog(`✅ Joined room successfully`);
+      } else {
+        addDebugLog(`⏳ Waiting for connection... (attempt ${attempts + 1})`);
+        setTimeout(() => tryJoinRoom(attempts + 1), 500);
+      }
+    };
+    
+    setTimeout(() => tryJoinRoom(), 1000);
+  }
+};
 
   const sendMessage = async () => {
     if (!inputMessage.trim() || !keysReady) return;
