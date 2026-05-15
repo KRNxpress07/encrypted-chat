@@ -95,5 +95,5 @@ http://localhost:3000
 
 ## Authors
 
-* Kiran Nambiar (24BYB1050)
-* Bhuvanesh Jatla (24BYB1113)
+* Kiran Nambiar
+* Bhuvanesh Jatla
