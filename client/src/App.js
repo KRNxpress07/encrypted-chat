@@ -5,16 +5,49 @@ import io from 'socket.io-client';
 // CRYPTOGRAPHY UTILITIES - Web Crypto API (Built into browsers)
 // ============================================================================
 const CryptoUtils = {
-  // Generate AES-256 key for symmetric encryption
-  async generateAESKey() {
+  // ── ECDH ──────────────────────────────────────────────────────────────────
+
+  // Generate ECDH key pair (P-256 curve)
+  async generateECDHKeyPair() {
     return await crypto.subtle.generateKey(
-      { name: 'AES-GCM', length: 256 },
+      { name: 'ECDH', namedCurve: 'P-256' },
       true,
+      ['deriveKey']
+    );
+  },
+
+  // Export ECDH public key to base64
+  async exportECDHPublicKey(publicKey) {
+    const exported = await crypto.subtle.exportKey('spki', publicKey);
+    return btoa(String.fromCharCode(...new Uint8Array(exported)));
+  },
+
+  // Import ECDH public key from base64
+  async importECDHPublicKey(base64Key) {
+    const binaryKey = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
+    return await crypto.subtle.importKey(
+      'spki',
+      binaryKey,
+      { name: 'ECDH', namedCurve: 'P-256' },
+      true,
+      []
+    );
+  },
+
+  // Derive a shared AES-256-GCM key from own ECDH private key + peer's ECDH public key
+  async deriveSharedAESKey(ownPrivateKey, peerPublicKey) {
+    return await crypto.subtle.deriveKey(
+      { name: 'ECDH', public: peerPublicKey },
+      ownPrivateKey,
+      { name: 'AES-GCM', length: 256 },
+      false,          // not extractable — stays in memory only
       ['encrypt', 'decrypt']
     );
   },
 
-  // Generate RSA-2048 key pair for asymmetric encryption
+  // ── RSA ───────────────────────────────────────────────────────────────────
+
+  // Generate RSA-2048 key pair for asymmetric (hybrid) encryption
   async generateRSAKeyPair() {
     return await crypto.subtle.generateKey(
       {
@@ -28,13 +61,13 @@ const CryptoUtils = {
     );
   },
 
-  // Export RSA public key to base64 string (for sharing)
+  // Export RSA public key to base64
   async exportPublicKey(publicKey) {
     const exported = await crypto.subtle.exportKey('spki', publicKey);
     return btoa(String.fromCharCode(...new Uint8Array(exported)));
   },
 
-  // Import RSA public key from base64 string
+  // Import RSA public key from base64
   async importPublicKey(base64Key) {
     const binaryKey = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
     return await crypto.subtle.importKey(
@@ -46,9 +79,10 @@ const CryptoUtils = {
     );
   },
 
-  // AES-GCM Encryption
+  // ── AES-GCM ───────────────────────────────────────────────────────────────
+
   async encryptAES(message, key) {
-    const iv = crypto.getRandomValues(new Uint8Array(12)); // Random IV
+    const iv = crypto.getRandomValues(new Uint8Array(12));
     const encoder = new TextEncoder();
     const data = encoder.encode(message);
 
@@ -64,7 +98,6 @@ const CryptoUtils = {
     };
   },
 
-  // AES-GCM Decryption
   async decryptAES(ciphertext, iv, key) {
     const ciphertextBytes = Uint8Array.from(atob(ciphertext), c => c.charCodeAt(0));
     const ivBytes = Uint8Array.from(atob(iv), c => c.charCodeAt(0));
@@ -78,18 +111,21 @@ const CryptoUtils = {
     return new TextDecoder().decode(decrypted);
   },
 
-  // Hybrid Encryption (RSA + AES)
+  // ── Hybrid (RSA + AES) ────────────────────────────────────────────────────
+
+  async generateAESKey() {
+    return await crypto.subtle.generateKey(
+      { name: 'AES-GCM', length: 256 },
+      true,
+      ['encrypt', 'decrypt']
+    );
+  },
+
   async encryptHybrid(message, recipientPublicKey) {
-    // Generate ephemeral AES key for this message
     const aesKey = await this.generateAESKey();
-    
-    // Encrypt message with AES
     const { ciphertext, iv } = await this.encryptAES(message, aesKey);
-    
-    // Export AES key as raw bytes
+
     const exportedAESKey = await crypto.subtle.exportKey('raw', aesKey);
-    
-    // Encrypt AES key with recipient's RSA public key
     const encryptedKey = await crypto.subtle.encrypt(
       { name: 'RSA-OAEP' },
       recipientPublicKey,
@@ -103,17 +139,14 @@ const CryptoUtils = {
     };
   },
 
-  // Hybrid Decryption
   async decryptHybrid(ciphertext, iv, encryptedKey, privateKey) {
-    // Decrypt AES key with RSA private key
     const encryptedKeyBytes = Uint8Array.from(atob(encryptedKey), c => c.charCodeAt(0));
     const aesKeyBytes = await crypto.subtle.decrypt(
       { name: 'RSA-OAEP' },
       privateKey,
       encryptedKeyBytes
     );
-    
-    // Import AES key
+
     const aesKey = await crypto.subtle.importKey(
       'raw',
       aesKeyBytes,
@@ -121,8 +154,7 @@ const CryptoUtils = {
       false,
       ['decrypt']
     );
-    
-    // Decrypt message
+
     return await this.decryptAES(ciphertext, iv, aesKey);
   }
 };
@@ -137,7 +169,7 @@ function App() {
   const [encryptionMode, setEncryptionMode] = useState('aes');
   const [showRawData, setShowRawData] = useState(false);
   const [debugLogs, setDebugLogs] = useState([]);
-  
+
   // Connection State
   const [roomId, setRoomId] = useState('');
   const [joinedRoom, setJoinedRoom] = useState(false);
@@ -145,171 +177,184 @@ function App() {
   const [username, setUsername] = useState('');
   const [connected, setConnected] = useState(false);
   const [peerUsername, setPeerUsername] = useState(null);
-  
+
   // Crypto State
-  const [aesKey, setAesKey] = useState(null);
+  const [ecdhKeyPair, setEcdhKeyPair] = useState(null);       // Our ECDH key pair
+  const [sharedAESKey, setSharedAESKey] = useState(null);     // Derived via ECDH
   const [rsaKeyPair, setRsaKeyPair] = useState(null);
   const [peerRSAKey, setPeerRSAKey] = useState(null);
   const [keysReady, setKeysReady] = useState(false);
-  
+  const [ecdhComplete, setEcdhComplete] = useState(false);    // True once shared key derived
+
   // Refs
   const messagesEndRef = useRef(null);
   const socketRef = useRef(null);
+
+  // Keep latest crypto state accessible inside socket callbacks without re-subscribing
+  const sharedAESKeyRef = useRef(null);
+  const rsaKeyPairRef = useRef(null);
+
+  useEffect(() => { sharedAESKeyRef.current = sharedAESKey; }, [sharedAESKey]);
+  useEffect(() => { rsaKeyPairRef.current = rsaKeyPair; }, [rsaKeyPair]);
 
   // ============================================================================
   // SOCKET.IO CONNECTION
   // ============================================================================
   useEffect(() => {
-  if (!joinedRoom) return;
+    if (!joinedRoom) return;
 
-  const SERVER_URL = 'https://encrypted-chat-server-sayx.onrender.com';
-  addDebugLog(`🌐 Connecting to server: ${SERVER_URL}`);
-  
-  socketRef.current = io(SERVER_URL, {
-    transports: ['websocket', 'polling'],
-    reconnection: true,
-    reconnectionAttempts: 3,
-    reconnectionDelay: 1000
-  });
+    const SERVER_URL = 'http://localhost:3001';
+    addDebugLog(`🌐 Connecting to server: ${SERVER_URL}`);
 
-  socketRef.current.on('connect', () => {
-    addDebugLog('✅ Connected to server');
-    setConnected(true);
-    
-    // Only rejoin if we have all the necessary data
-    // Don't read from state here to avoid dependency loop
-  });
+    socketRef.current = io(SERVER_URL, {
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 3,
+      reconnectionDelay: 1000
+    });
 
-  socketRef.current.on('disconnect', () => {
-    addDebugLog('❌ Disconnected from server');
-    setConnected(false);
-  });
+    socketRef.current.on('connect', () => {
+      addDebugLog('✅ Connected to server');
+      setConnected(true);
+    });
 
-  socketRef.current.on('existing-users', async (users) => {
-    addDebugLog(`👥 Found ${users.length} existing user(s) in room`);
-    
-    for (const user of users) {
-      if (user.userId === userId) continue; // Skip self
-      
-      setPeerUsername(user.username);
-      
-      if (user.aesKey) {
-        try {
-          const key = await importAESKey(user.aesKey);
-          setAesKey(key);
-          addDebugLog(`🔑 Imported shared AES key from ${user.username}`);
-        } catch (error) {
-          addDebugLog(`❌ Failed to import AES key: ${error.message}`);
+    socketRef.current.on('disconnect', () => {
+      addDebugLog('❌ Disconnected from server');
+      setConnected(false);
+    });
+
+    // ── Peer already in room when we join ──────────────────────────────────
+    socketRef.current.on('existing-users', async (users) => {
+      addDebugLog(`👥 Found ${users.length} existing user(s) in room`);
+
+      for (const user of users) {
+        if (user.userId === userId) continue;
+
+        setPeerUsername(user.username);
+
+        // ECDH: derive shared AES key from peer's ECDH public key
+        if (user.ecdhPublicKey && ecdhKeyPair) {
+          try {
+            const peerECDHKey = await CryptoUtils.importECDHPublicKey(user.ecdhPublicKey);
+            const derived = await CryptoUtils.deriveSharedAESKey(ecdhKeyPair.privateKey, peerECDHKey);
+            setSharedAESKey(derived);
+            sharedAESKeyRef.current = derived;
+            setEcdhComplete(true);
+            addDebugLog(`🤝 ECDH complete — shared AES key derived with ${user.username}`);
+          } catch (error) {
+            addDebugLog(`❌ ECDH derivation failed: ${error.message}`);
+          }
+        }
+
+        // Hybrid mode: import peer's RSA public key
+        if (user.rsaPublicKey) {
+          try {
+            const key = await CryptoUtils.importPublicKey(user.rsaPublicKey);
+            setPeerRSAKey(key);
+            addDebugLog(`🔑 Imported ${user.username}'s RSA public key`);
+          } catch (error) {
+            addDebugLog(`❌ Failed to import peer RSA key: ${error.message}`);
+          }
         }
       }
-      
-      if (user.rsaPublicKey) {
+    });
+
+    // ── New peer joins after us ────────────────────────────────────────────
+    socketRef.current.on('user-joined', async (data) => {
+      if (data.userId === userId) return;
+
+      addDebugLog(`👤 ${data.username} joined the room`);
+      setPeerUsername(data.username);
+
+      // ECDH: derive shared AES key
+      if (data.ecdhPublicKey && ecdhKeyPair) {
         try {
-          const key = await CryptoUtils.importPublicKey(user.rsaPublicKey);
+          const peerECDHKey = await CryptoUtils.importECDHPublicKey(data.ecdhPublicKey);
+          const derived = await CryptoUtils.deriveSharedAESKey(ecdhKeyPair.privateKey, peerECDHKey);
+          setSharedAESKey(derived);
+          sharedAESKeyRef.current = derived;
+          setEcdhComplete(true);
+          addDebugLog(`🤝 ECDH complete — shared AES key derived with ${data.username}`);
+        } catch (error) {
+          addDebugLog(`❌ ECDH derivation failed: ${error.message}`);
+        }
+      }
+
+      // Hybrid mode: import peer's RSA public key
+      if (data.rsaPublicKey) {
+        try {
+          const key = await CryptoUtils.importPublicKey(data.rsaPublicKey);
           setPeerRSAKey(key);
-          addDebugLog(`🔑 Imported ${user.username}'s RSA public key`);
+          addDebugLog(`🔑 Received ${data.username}'s RSA public key`);
         } catch (error) {
           addDebugLog(`❌ Failed to import peer RSA key: ${error.message}`);
         }
       }
-    }
-  });
+    });
 
-  socketRef.current.on('user-joined', async (data) => {
-    if (data.userId === userId) return; // Skip self
-    
-    addDebugLog(`👤 ${data.username} joined the room`);
-    setPeerUsername(data.username);
-    
-    if (data.aesKey) {
-      try {
-        const key = await importAESKey(data.aesKey);
-        setAesKey(key);
-        addDebugLog(`🔑 Imported shared AES key from ${data.username}`);
-      } catch (error) {
-        addDebugLog(`❌ Failed to import AES key: ${error.message}`);
-      }
-    }
-    
-    if (data.rsaPublicKey) {
-      try {
-        const key = await CryptoUtils.importPublicKey(data.rsaPublicKey);
-        setPeerRSAKey(key);
-        addDebugLog(`🔑 Received ${data.username}'s RSA public key`);
-      } catch (error) {
-        addDebugLog(`❌ Failed to import peer RSA key: ${error.message}`);
-      }
-    }
-  });
+    // ── Incoming encrypted message ─────────────────────────────────────────
+    socketRef.current.on('encrypted-message', async (data) => {
+      addDebugLog(`📥 Encrypted message received from ${data.senderName}`);
 
-  socketRef.current.on('encrypted-message', async (data) => {
-    console.log('🔔 RAW MESSAGE RECEIVED:', data);
-    addDebugLog(`📥 Encrypted message received from ${data.senderName}`);
-    
-    try {
-      let decrypted;
-      
-      if (data.mode === 'aes') {
-        // Get current AES key from state
-        const currentAesKey = aesKey;
-        if (!currentAesKey) {
-          addDebugLog(`⚠️ Cannot decrypt: no AES key available`);
+      try {
+        let decrypted;
+
+        if (data.mode === 'aes') {
+          const key = sharedAESKeyRef.current;
+          if (!key) {
+            addDebugLog(`⚠️ Cannot decrypt: ECDH handshake not complete`);
+            return;
+          }
+          decrypted = await CryptoUtils.decryptAES(
+            data.encrypted.ciphertext,
+            data.encrypted.iv,
+            key
+          );
+          addDebugLog(`🔓 Decrypted with ECDH-derived AES-256-GCM`);
+        } else if (data.mode === 'hybrid') {
+          const kp = rsaKeyPairRef.current;
+          if (!kp) {
+            addDebugLog(`⚠️ Cannot decrypt: no RSA key pair`);
+            return;
+          }
+          decrypted = await CryptoUtils.decryptHybrid(
+            data.encrypted.ciphertext,
+            data.encrypted.iv,
+            data.encrypted.encryptedKey,
+            kp.privateKey
+          );
+          addDebugLog(`🔓 Decrypted with Hybrid (RSA+AES)`);
+        } else {
+          addDebugLog(`⚠️ Unknown encryption mode: ${data.mode}`);
           return;
         }
-        
-        decrypted = await CryptoUtils.decryptAES(
-          data.encrypted.ciphertext,
-          data.encrypted.iv,
-          currentAesKey
-        );
-        addDebugLog(`🔓 Decrypted with AES-GCM`);
-      } else if (data.mode === 'hybrid') {
-        // Get current RSA key pair from state
-        const currentRsaKeyPair = rsaKeyPair;
-        if (!currentRsaKeyPair) {
-          addDebugLog(`⚠️ Cannot decrypt: no RSA key pair available`);
-          return;
-        }
-        
-        decrypted = await CryptoUtils.decryptHybrid(
-          data.encrypted.ciphertext,
-          data.encrypted.iv,
-          data.encrypted.encryptedKey,
-          currentRsaKeyPair.privateKey
-        );
-        addDebugLog(`🔓 Decrypted with Hybrid (RSA+AES)`);
-      } else {
-        addDebugLog(`⚠️ Unknown encryption mode: ${data.mode}`);
-        return;
+
+        setMessages(prev => [...prev, {
+          id: data.id,
+          sender: data.senderName,
+          mode: data.mode === 'aes' ? 'ECDH+AES-GCM' : 'Hybrid (RSA+AES)',
+          encrypted: data.encrypted,
+          plaintext: decrypted,
+          timestamp: data.timestamp,
+          isOwn: false
+        }]);
+      } catch (error) {
+        addDebugLog(`❌ Decryption failed: ${error.message}`);
       }
+    });
 
-      setMessages(prev => [...prev, {
-        id: data.id,
-        sender: data.senderName,
-        mode: data.mode === 'aes' ? 'AES-GCM' : 'Hybrid (RSA+AES)',
-        encrypted: data.encrypted,
-        plaintext: decrypted,
-        timestamp: data.timestamp,
-        isOwn: false
-      }]);
-    } catch (error) {
-      addDebugLog(`❌ Decryption failed: ${error.message}`);
-      console.error('Decryption error:', error);
-    }
-  });
+    socketRef.current.on('user-left', (data) => {
+      addDebugLog(`👋 ${data.username} left the room`);
+      setPeerUsername(null);
+      setPeerRSAKey(null);
+      setSharedAESKey(null);
+      setEcdhComplete(false);
+    });
 
-  socketRef.current.on('user-left', (data) => {
-    addDebugLog(`👋 ${data.username} left the room`);
-    setPeerUsername(null);
-    setPeerRSAKey(null);
-  });
-
-  return () => {
-    if (socketRef.current) {
-      socketRef.current.disconnect();
-    }
-  };
-}, [joinedRoom]); // ONLY depend on joinedRoom!
+    return () => {
+      if (socketRef.current) socketRef.current.disconnect();
+    };
+  }, [joinedRoom]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ============================================================================
   // UTILITY FUNCTIONS
@@ -323,85 +368,69 @@ function App() {
   const initializeKeys = async () => {
     try {
       addDebugLog('🔐 Generating encryption keys...');
-      
-      // Generate AES key (will be shared with peers)
-      const aes = await CryptoUtils.generateAESKey();
-      setAesKey(aes);
-      addDebugLog('✅ AES-256-GCM key generated');
-      
-      // Generate RSA key pair
+
+      // ECDH key pair — public key shared with peer, private key stays local
+      const ecdh = await CryptoUtils.generateECDHKeyPair();
+      setEcdhKeyPair(ecdh);
+      addDebugLog('✅ ECDH P-256 key pair generated');
+
+      // RSA key pair for hybrid mode
       const rsa = await CryptoUtils.generateRSAKeyPair();
       setRsaKeyPair(rsa);
+      rsaKeyPairRef.current = rsa;
       addDebugLog('✅ RSA-2048 key pair generated');
-      
+
       setKeysReady(true);
       addDebugLog('🎉 All keys ready!');
-      
-      return { aes, rsa };
+
+      return { ecdh, rsa };
     } catch (error) {
       addDebugLog(`❌ Key generation failed: ${error.message}`);
       return null;
     }
   };
 
-  // Add utility to export/import AES keys
-  const exportAESKey = async (key) => {
-    const exported = await crypto.subtle.exportKey('raw', key);
-    return btoa(String.fromCharCode(...new Uint8Array(exported)));
-  };
-
-  const importAESKey = async (base64Key) => {
-    const binaryKey = Uint8Array.from(atob(base64Key), c => c.charCodeAt(0));
-    return await crypto.subtle.importKey(
-      'raw',
-      binaryKey,
-      { name: 'AES-GCM' },
-      true,
-      ['encrypt', 'decrypt']
-    );
-  };
-
   const joinRoom = async () => {
-  if (!roomId.trim() || !username.trim()) {
-    alert('⚠️ Please enter both username and room ID');
-    return;
-  }
+    if (!roomId.trim() || !username.trim()) {
+      alert('⚠️ Please enter both username and room ID');
+      return;
+    }
 
-  addDebugLog(`🚀 Joining room: ${roomId}`);
-  const keys = await initializeKeys();
-  
-  if (keys) {
-    setJoinedRoom(true);
-    
-    // Wait for socket to connect with retry logic
-    const tryJoinRoom = async (attempts = 0) => {
-      if (attempts > 10) {
-        addDebugLog('❌ Failed to join room after 10 attempts');
-        return;
-      }
-      
-      if (socketRef.current && socketRef.current.connected) {
-        const exportedRSA = await CryptoUtils.exportPublicKey(keys.rsa.publicKey);
-        const exportedAES = await exportAESKey(keys.aes);
-        
-        socketRef.current.emit('join-room', {
-          roomId,
-          userId,
-          username,
-          rsaPublicKey: exportedRSA,
-          aesKey: exportedAES
-        });
-        
-        addDebugLog(`✅ Joined room successfully`);
-      } else {
-        addDebugLog(`⏳ Waiting for connection... (attempt ${attempts + 1})`);
-        setTimeout(() => tryJoinRoom(attempts + 1), 500);
-      }
-    };
-    
-    setTimeout(() => tryJoinRoom(), 1000);
-  }
-};
+    addDebugLog(`🚀 Joining room: ${roomId}`);
+    const keys = await initializeKeys();
+
+    if (keys) {
+      setJoinedRoom(true);
+
+      const tryJoinRoom = async (attempts = 0) => {
+        if (attempts > 10) {
+          addDebugLog('❌ Failed to join room after 10 attempts');
+          return;
+        }
+
+        if (socketRef.current && socketRef.current.connected) {
+          const exportedECDH = await CryptoUtils.exportECDHPublicKey(keys.ecdh.publicKey);
+          const exportedRSA = await CryptoUtils.exportPublicKey(keys.rsa.publicKey);
+
+          socketRef.current.emit('join-room', {
+            roomId,
+            userId,
+            username,
+            ecdhPublicKey: exportedECDH,   // replaces raw aesKey
+            rsaPublicKey: exportedRSA
+            // ⚠️  No aesKey sent — the shared secret is derived locally via ECDH
+          });
+
+          addDebugLog(`✅ Joined room, ECDH public key shared`);
+        } else {
+          addDebugLog(`⏳ Waiting for connection... (attempt ${attempts + 1})`);
+          setTimeout(() => tryJoinRoom(attempts + 1), 500);
+        }
+      };
+
+      setTimeout(() => tryJoinRoom(), 1000);
+    }
+  };
 
   const sendMessage = async () => {
     if (!inputMessage.trim() || !keysReady) return;
@@ -415,13 +444,17 @@ function App() {
       let modeLabel;
 
       if (encryptionMode === 'aes') {
-        addDebugLog(`🔒 Encrypting with AES-GCM...`);
-        encryptedData = await CryptoUtils.encryptAES(inputMessage, aesKey);
-        modeLabel = 'AES-GCM';
+        if (!sharedAESKey) {
+          alert('⚠️ ECDH handshake not complete yet. Wait for the peer to connect.');
+          return;
+        }
+        addDebugLog(`🔒 Encrypting with ECDH-derived AES-256-GCM...`);
+        encryptedData = await CryptoUtils.encryptAES(inputMessage, sharedAESKey);
+        modeLabel = 'ECDH+AES-GCM';
         addDebugLog(`✅ Message encrypted (${encryptedData.ciphertext.length} chars)`);
       } else {
         if (!peerRSAKey) {
-          alert('⚠️ Hybrid mode requires peer to be connected. Use AES mode or wait.');
+          alert('⚠️ Hybrid mode requires peer to be connected.');
           return;
         }
         addDebugLog(`🔒 Encrypting with Hybrid (RSA+AES)...`);
@@ -441,18 +474,9 @@ function App() {
         isOwn: true
       };
 
-      // Add to local messages
-      setMessages(prev => [...prev, {
-        ...messageObj,
-        mode: modeLabel
-      }]);
-      
-      // Send encrypted message to server
-      socketRef.current.emit('encrypted-message', {
-        ...messageObj,
-        roomId
-      });
+      setMessages(prev => [...prev, { ...messageObj, mode: modeLabel }]);
 
+      socketRef.current.emit('encrypted-message', { ...messageObj, roomId });
       setInputMessage('');
       addDebugLog(`📤 Encrypted message sent`);
     } catch (error) {
@@ -463,13 +487,15 @@ function App() {
 
   const handleModeChange = (newMode) => {
     if (newMode === 'hybrid' && !peerRSAKey) {
-      alert('⚠️ Hybrid mode requires a peer with RSA key. Use AES mode for now.');
+      alert('⚠️ Hybrid mode requires a peer with RSA key.');
       return;
     }
-    
+    if (newMode === 'aes' && !ecdhComplete) {
+      alert('⚠️ AES mode requires ECDH handshake. Wait for peer to connect.');
+      return;
+    }
     if (messages.length > 0) {
-      const confirmChange = window.confirm('⚠️ Changing encryption mode mid-chat. Continue?');
-      if (!confirmChange) return;
+      if (!window.confirm('⚠️ Changing encryption mode mid-chat. Continue?')) return;
       addDebugLog(`⚠️ Mode changed: ${encryptionMode.toUpperCase()} → ${newMode.toUpperCase()}`);
     }
     setEncryptionMode(newMode);
@@ -539,7 +565,7 @@ function App() {
             <ol className="list-decimal list-inside space-y-1">
               <li>Enter username and room ID</li>
               <li>Share room ID with your friend</li>
-              <li>Keys generated automatically</li>
+              <li>ECDH handshake happens automatically</li>
               <li>Chat with end-to-end encryption!</li>
             </ol>
           </div>
@@ -583,6 +609,9 @@ function App() {
               <span className={keysReady ? 'text-green-400' : 'text-yellow-400'}>
                 {keysReady ? '✅ Keys Ready' : '⏳ Generating...'}
               </span>
+              <span className={ecdhComplete ? 'text-green-400' : 'text-yellow-400'}>
+                {ecdhComplete ? '🤝 ECDH Complete' : '⏳ Awaiting peer for ECDH...'}
+              </span>
               {peerRSAKey && (
                 <span className="text-green-400">✅ Peer RSA Key</span>
               )}
@@ -610,7 +639,7 @@ function App() {
                 }`}
               >
                 <div className="text-sm font-bold">🔒 AES-GCM</div>
-                <div className="text-xs opacity-70">Symmetric • Fast</div>
+                <div className="text-xs opacity-70">ECDH key exchange</div>
               </button>
               <button
                 onClick={() => handleModeChange('hybrid')}
@@ -685,13 +714,17 @@ function App() {
                   value={inputMessage}
                   onChange={(e) => setInputMessage(e.target.value)}
                   onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
-                  placeholder={keysReady ? "Type a secure message..." : "Generating keys..."}
-                  disabled={!keysReady || !connected}
+                  placeholder={
+                    !keysReady ? "Generating keys..." :
+                    (encryptionMode === 'aes' && !ecdhComplete) ? "Waiting for peer (ECDH)..." :
+                    "Type a secure message..."
+                  }
+                  disabled={!keysReady || !connected || (encryptionMode === 'aes' && !ecdhComplete)}
                   className="flex-1 bg-slate-900/50 text-white px-4 py-3 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-500 disabled:opacity-50"
                 />
                 <button
                   onClick={sendMessage}
-                  disabled={!keysReady || !inputMessage.trim() || !connected}
+                  disabled={!keysReady || !inputMessage.trim() || !connected || (encryptionMode === 'aes' && !ecdhComplete)}
                   className="px-6 py-3 bg-purple-600 hover:bg-purple-700 disabled:bg-slate-700 disabled:cursor-not-allowed rounded-lg font-bold transition shadow-lg shadow-purple-500/30"
                 >
                   🔒 Send
@@ -729,11 +762,11 @@ function App() {
             Security Features Active
           </h3>
           <ul className="grid grid-cols-2 gap-2 text-xs text-slate-300">
-            <li>✅ Client-side encryption only</li>
+            <li>✅ ECDH P-256 key exchange (AES mode)</li>
             <li>✅ Fresh IV per message</li>
             <li>✅ AES-256-GCM encryption</li>
-            <li>✅ RSA-2048-OAEP key exchange</li>
-            <li>✅ Server never sees plaintext</li>
+            <li>✅ RSA-2048-OAEP (Hybrid mode)</li>
+            <li>✅ Server never sees plaintext or AES key</li>
             <li>✅ Forward secrecy (Hybrid mode)</li>
           </ul>
         </div>

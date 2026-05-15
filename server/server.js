@@ -1,5 +1,5 @@
 // server.js - E2E Encrypted Chat Server
-// This server ONLY relays encrypted messages - it NEVER sees plaintext
+// This server ONLY relays encrypted messages and public keys - it NEVER sees plaintext or the shared secret
 
 const express = require('express');
 const http = require('http');
@@ -9,11 +9,9 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 
-// Configure Socket.IO with CORS to allow frontend connections
 const io = socketIO(server, {
   cors: {
     origin: [
-      "https://encrypted-chat-ten.vercel.app",
       "http://localhost:3000"
     ],
     methods: ["GET", "POST"]
@@ -26,82 +24,72 @@ app.use(express.json());
 // Store active rooms: roomId -> Map of userId -> user data
 const rooms = new Map();
 
-// When a client connects
 io.on('connection', (socket) => {
   console.log(`✅ New connection: ${socket.id}`);
 
-  // Handle user joining a room
   socket.on('join-room', (data) => {
-    const { roomId, userId, username, rsaPublicKey, aesKey } = data;
-    
-    // Add user to the room
+    const { roomId, userId, username, ecdhPublicKey, rsaPublicKey } = data;
+
     socket.join(roomId);
-    
-    // Store room if it doesn't exist
+
     if (!rooms.has(roomId)) {
       rooms.set(roomId, new Map());
     }
-    
-    // Store user info (including shared AES key)
+
+    // Store user info — ECDH public key replaces raw aesKey
+    // The shared AES secret is derived independently on each client; the server never sees it
     rooms.get(roomId).set(userId, {
       socketId: socket.id,
       username,
-      rsaPublicKey,
-      aesKey // Store AES key for sharing with other users
+      ecdhPublicKey,  // public key only — safe to relay
+      rsaPublicKey
     });
 
     console.log(`👤 ${username} joined room: ${roomId} (${rooms.get(roomId).size} users)`);
 
-    // Tell others in the room that someone joined
+    // Notify existing peers
     socket.to(roomId).emit('user-joined', {
       userId,
       username,
-      rsaPublicKey,
-      aesKey
+      ecdhPublicKey,
+      rsaPublicKey
     });
 
-    // Send list of existing users to the new joiner
+    // Send existing users to the new joiner so they can complete the ECDH handshake
     const roomUsers = rooms.get(roomId);
     const existingUsers = Array.from(roomUsers.entries())
       .filter(([id]) => id !== userId)
       .map(([id, user]) => ({
         userId: id,
         username: user.username,
-        rsaPublicKey: user.rsaPublicKey,
-        aesKey: user.aesKey
+        ecdhPublicKey: user.ecdhPublicKey,
+        rsaPublicKey: user.rsaPublicKey
       }));
 
     if (existingUsers.length > 0) {
       socket.emit('existing-users', existingUsers);
-      console.log(`📤 Sent ${existingUsers.length} existing users to ${username}`);
+      console.log(`📤 Sent ${existingUsers.length} existing user(s) to ${username}`);
     }
   });
 
-  // Handle encrypted messages (server never decrypts!)
+  // Relay encrypted messages — server never decrypts
   socket.on('encrypted-message', (data) => {
     const { roomId, senderName } = data;
     console.log(`📨 Relaying encrypted message from ${senderName} in room: ${roomId}`);
-    
-    // Simply relay the encrypted message to everyone else in the room
     socket.to(roomId).emit('encrypted-message', data);
   });
 
-  // Handle user disconnect
   socket.on('disconnect', () => {
     console.log(`❌ Client disconnected: ${socket.id}`);
-    
-    // Remove user from all rooms
+
     rooms.forEach((roomUsers, roomId) => {
       roomUsers.forEach((user, userId) => {
         if (user.socketId === socket.id) {
           const username = user.username;
           roomUsers.delete(userId);
-          
-          // Notify others
           socket.to(roomId).emit('user-left', { userId, username });
           console.log(`👋 ${username} left room: ${roomId}`);
-          
-          // Clean up empty rooms
+
           if (roomUsers.size === 0) {
             rooms.delete(roomId);
             console.log(`🗑️ Room ${roomId} deleted (empty)`);
@@ -112,7 +100,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'online',
@@ -121,7 +108,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Start server
 const PORT = process.env.PORT || 3001;
 
 server.listen(PORT, () => {
@@ -133,17 +119,12 @@ server.listen(PORT, () => {
 ║  Port: ${PORT}                                        ║
 ║  Status: READY FOR CONNECTIONS                    ║
 ║  Security: Server NEVER sees plaintext            ║
+║            or the derived shared secret           ║
 ║                                                    ║
 ╚════════════════════════════════════════════════════╝
-
-Server is running on http://localhost:${PORT}
-Health check: http://localhost:${PORT}/health
-
-Waiting for clients to connect...
   `);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('\nShutting down server...');
   server.close(() => {
